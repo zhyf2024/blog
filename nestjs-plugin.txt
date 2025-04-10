@@ -1,0 +1,205 @@
+// src/decorators/plugin.decorator.ts
+import 'reflect-metadata';
+
+export interface PluginOptions {
+  name: string;
+  description?: string;
+  version?: string;
+  roles?: string[];
+}
+
+export function Plugin(options: PluginOptions): ClassDecorator {
+  return (target) => {
+    Reflect.defineMetadata('plugin:meta', options, target);
+  };
+}
+
+export function getPluginMetadata(target: any): PluginOptions | undefined {
+  return Reflect.getMetadata('plugin:meta', target);
+}
+
+
+// src/lifecycle/plugin-lifecycle.interface.ts
+export interface PluginLifecycle {
+  onLoad?(): Promise<void>;
+  onInit?(): Promise<void>;
+  onDestroy?(): Promise<void>;
+}
+
+
+// src/core/plugin.service.ts
+import { Injectable } from '@nestjs/common';
+
+export interface PluginEntity {
+  name: string;
+  description: string;
+  isEnabled: boolean;
+  version: string;
+  config: Record<string, any>;
+}
+
+@Injectable()
+export class PluginService {
+  private plugins: PluginEntity[] = [
+    {
+      name: 'UserPlugin',
+      description: 'Handles user logic',
+      isEnabled: true,
+      version: '1.0.0',
+      config: {},
+    },
+  ];
+
+  async getEnabledPluginNames(): Promise<string[]> {
+    return this.plugins.filter((p) => p.isEnabled).map((p) => p.name);
+  }
+
+  async getAllPlugins(): Promise<PluginEntity[]> {
+    return this.plugins;
+  }
+
+  async enablePlugin(name: string): Promise<void> {
+    const plugin = this.plugins.find((p) => p.name === name);
+    if (plugin) plugin.isEnabled = true;
+  }
+
+  async disablePlugin(name: string): Promise<void> {
+    const plugin = this.plugins.find((p) => p.name === name);
+    if (plugin) plugin.isEnabled = false;
+  }
+
+  async getPluginConfig(name: string): Promise<Record<string, any>> {
+    return this.plugins.find((p) => p.name === name)?.config || {};
+  }
+}
+
+
+// src/utils/plugin-loader.ts
+import * as path from 'path';
+import * as fs from 'fs';
+import { DynamicModule, Type } from '@nestjs/common';
+import { getPluginMetadata } from '../decorators/plugin.decorator';
+import { PluginLifecycle } from '../lifecycle/plugin-lifecycle.interface';
+import { PluginService } from '../core/plugin.service';
+
+const PLUGIN_DIR = path.resolve(__dirname, '../plugins');
+
+export async function loadPlugins(pluginService: PluginService): Promise<DynamicModule[]> {
+  const enabledPlugins = await pluginService.getEnabledPluginNames();
+  const loadedModules: DynamicModule[] = [];
+
+  for (const dir of fs.readdirSync(PLUGIN_DIR)) {
+    const fullPath = path.join(PLUGIN_DIR, dir);
+    const files = fs.readdirSync(fullPath).filter((f) => f.endsWith('.module.ts') || f.endsWith('.module.js'));
+
+    for (const file of files) {
+      const moduleExports = await import(path.join(fullPath, file));
+
+      for (const exported in moduleExports) {
+        const Mod = moduleExports[exported];
+        const meta = getPluginMetadata(Mod);
+
+        if (meta && enabledPlugins.includes(meta.name)) {
+          if ('onLoad' in Mod.prototype) {
+            const instance = new Mod();
+            await (instance as PluginLifecycle).onLoad?.();
+          }
+
+          loadedModules.push({ module: Mod });
+        }
+      }
+    }
+  }
+
+  return loadedModules;
+}
+
+
+// src/core/plugin.controller.ts
+import { Controller, Get, Post, Body, Param } from '@nestjs/common';
+import { PluginService } from './plugin.service';
+
+@Controller('plugins')
+export class PluginController {
+  constructor(private readonly pluginService: PluginService) {}
+
+  @Get()
+  async getAllPlugins() {
+    return this.pluginService.getAllPlugins();
+  }
+
+  @Post(':name/enable')
+  async enablePlugin(@Param('name') name: string) {
+    await this.pluginService.enablePlugin(name);
+    return { success: true };
+  }
+
+  @Post(':name/disable')
+  async disablePlugin(@Param('name') name: string) {
+    await this.pluginService.disablePlugin(name);
+    return { success: true };
+  }
+}
+
+
+// src/app.module.ts
+import { Module, DynamicModule } from '@nestjs/common';
+import { PluginService } from './core/plugin.service';
+import { PluginController } from './core/plugin.controller';
+import { loadPlugins } from './utils/plugin-loader';
+
+@Module({})
+export class AppModule {
+  static async register(): Promise<DynamicModule> {
+    const pluginService = new PluginService();
+    const pluginModules = await loadPlugins(pluginService);
+
+    return {
+      module: AppModule,
+      imports: [...pluginModules],
+      providers: [PluginService],
+      controllers: [PluginController],
+    };
+  }
+}
+
+
+// src/main.ts
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const appModule = await AppModule.register();
+  const app = await NestFactory.create(appModule);
+  await app.listen(3000);
+}
+bootstrap();
+
+
+// 示例插件: src/plugins/user/user.module.ts
+import { Module } from '@nestjs/common';
+import { UserController } from './user.controller';
+import { Plugin } from '../../decorators/plugin.decorator';
+
+@Plugin({ name: 'UserPlugin', description: 'Handles user logic', version: '1.0.0' })
+@Module({
+  controllers: [UserController],
+})
+export class UserModule {
+  async onLoad() {
+    console.log('[UserPlugin] Loaded');
+  }
+}
+
+
+// 示例插件控制器: src/plugins/user/user.controller.ts
+import { Controller, Get } from '@nestjs/common';
+
+@Controller('user')
+export class UserController {
+  @Get()
+  hello() {
+    return 'Hello from User Plugin';
+  }
+}
+
